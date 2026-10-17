@@ -4721,7 +4721,7 @@ func (a *Association) onRackAfterSACK( // nolint:gocognit,cyclop,gocyclo
 		}
 	}
 
-	// 3) Loss marking on ACK: any outstanding chunk whose (send_time + reoWnd) < newestDeliveredSendTime
+	// 3) Loss marking on ACK: any outstanding chunk whose (last transmission time + reoWnd) < newestDeliveredSendTime
 	// is lost (RACK for SCTP section 2A)
 	if !a.rackDeliveredTime.IsZero() { //nolint:nestif
 		marked := false
@@ -4737,15 +4737,14 @@ func (a *Association) onRackAfterSACK( // nolint:gocognit,cyclop,gocyclo
 				continue
 			}
 
-			if chunk.retransmit || chunk.nSent > 1 {
-				// Either already scheduled for retransmit or not an original send:
-				// skip but keep in list in case it's still outstanding.
+			if chunk.retransmit {
+				// Already scheduled for retransmit; keep it in the list in case it is still outstanding.
 				chunk = next
 
 				continue
 			}
 
-			// Ordered by original send time. If this one is too new,
+			// Ordered by latest transmission time. If this one is too new,
 			// all later ones are even newer -> short-circuit.
 			if !chunk.since.Add(a.rackReoWnd).Before(a.rackDeliveredTime) {
 				break
@@ -4858,7 +4857,7 @@ func (a *Association) onRackTimeoutLocked() { //nolint:cyclop
 
 			continue
 		}
-		if chunk.retransmit || chunk.nSent > 1 {
+		if chunk.retransmit {
 			chunk = next
 
 			continue

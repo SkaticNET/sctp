@@ -6,6 +6,7 @@
 package sctp
 
 import (
+	"bytes"
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/binary"
@@ -6846,6 +6847,252 @@ func TestRACK_TimerMarksLost(t *testing.T) {
 	require.True(t, ok, "TSN 100 should still be in inflightQueue")
 	require.NotNil(t, got)
 	assert.True(t, got.retransmit, "RACK timer should mark overdue original as lost")
+}
+
+func TestRACK_MarksOldRetransmissionLost(t *testing.T) {
+	for _, entrypoint := range []string{"sack", "timer"} {
+		for _, tc := range []struct {
+			name           string
+			hasEvidence    bool
+			sendAfter      time.Duration
+			acked          bool
+			abandoned      bool
+			retransmit     bool
+			wantRetransmit bool
+		}{
+			{name: "old last send with later delivery evidence", hasEvidence: true, sendAfter: -50 * time.Millisecond, wantRetransmit: true},
+			{name: "last send newer than delivery evidence", hasEvidence: true, sendAfter: 20 * time.Millisecond},
+			{name: "no later delivery evidence", sendAfter: -50 * time.Millisecond},
+			{name: "already acknowledged", hasEvidence: true, sendAfter: -50 * time.Millisecond, acked: true},
+			{name: "abandoned", hasEvidence: true, sendAfter: -50 * time.Millisecond, abandoned: true},
+			{name: "already scheduled", hasEvidence: true, sendAfter: -50 * time.Millisecond, retransmit: true},
+		} {
+			t.Run(entrypoint+"/"+tc.name, func(t *testing.T) {
+				assoc := newRackTestAssoc(t)
+				cleanupConn, cleanupPeer := net.Pipe()
+				assoc.netConn = cleanupConn
+				t.Cleanup(func() {
+					assoc.lock.Lock()
+					defer assoc.lock.Unlock()
+					_ = assoc.close()
+					_ = cleanupPeer.Close()
+				})
+				assoc.rackReoWnd = 10 * time.Millisecond
+				evidenceTime := time.Now()
+				sendTime := evidenceTime.Add(tc.sendAfter)
+				chunk := mkChunk(100, sendTime)
+				chunk.nSent = 2
+				chunk.acked = tc.acked
+				chunk.retransmit = tc.retransmit
+				if tc.abandoned {
+					chunk.setAllInflight()
+					chunk.setAbandoned(true)
+				}
+				assoc.inflightQueue.pushNoCheck(chunk)
+				assoc.rackInsert(chunk)
+
+				if entrypoint == "sack" {
+					if tc.hasEvidence {
+						assoc.onRackAfterSACK(true, evidenceTime, 101, &chunkSelectiveAck{})
+					} else {
+						assoc.onRackAfterSACK(false, time.Time{}, 0, &chunkSelectiveAck{})
+					}
+					assoc.stopRackTimer()
+					assoc.stopPTOTimer()
+				} else if tc.hasEvidence {
+					assoc.rackDeliveredTime = evidenceTime
+					assoc.onRackTimeout()
+				} else {
+					assoc.onRackTimeout()
+				}
+
+				assert.Equal(t, tc.wantRetransmit || tc.retransmit, chunk.retransmit)
+			})
+		}
+	}
+}
+
+func TestRACK_RecoversRetransmittedChunkAfterLaterOriginalACK(t *testing.T) {
+	lim := test.TimeOut(8 * time.Second)
+	defer lim.Stop()
+
+	br := test.NewBridge()
+	a0, a1, err := createNewAssociationPair(br, ackModeNoDelay, 0)
+	require.NoError(t, err)
+	defer closeAssociationPair(br, a0, a1)
+	s0, s1, err := establishSessionPair(br, a0, a1, 1)
+	require.NoError(t, err)
+
+	target := bytes.Repeat([]byte{0xa1}, 512)
+	witness := bytes.Repeat([]byte{0xb2}, 513)
+	sentinel := bytes.Repeat([]byte{0xc3}, 514)
+	var targetAttempts, sentinelAttempts atomic.Uint32
+	var witnessAttempts atomic.Uint32
+	var sackCount, gapSACKCount atomic.Uint32
+	var targetTSN atomic.Uint32
+	var allowTarget, allowSentinel, sackReleased atomic.Bool
+	heldGapSACK := make(chan []byte, 1)
+	br.Filter(0, func(raw []byte) bool {
+		p := &packet{}
+		if p.unmarshal(true, raw) != nil {
+			return true
+		}
+		for _, c := range p.chunks {
+			data, ok := c.(*chunkPayloadData)
+			if !ok {
+				continue
+			}
+			if bytes.Equal(data.userData, target) {
+				targetTSN.Store(data.tsn)
+				attempt := targetAttempts.Add(1)
+				return allowTarget.Load() && attempt >= 3
+			}
+			if bytes.Equal(data.userData, sentinel) {
+				sentinelAttempts.Add(1)
+				return allowSentinel.Load()
+			}
+			if bytes.Equal(data.userData, witness) {
+				witnessAttempts.Add(1)
+			}
+		}
+		return true
+	})
+	br.Filter(1, func(raw []byte) bool {
+		p := &packet{}
+		if p.unmarshal(true, raw) != nil {
+			return true
+		}
+		for _, c := range p.chunks {
+			if sack, ok := c.(*chunkSelectiveAck); ok {
+				sackCount.Add(1)
+				if len(sack.gapAckBlocks) > 0 {
+					gapSACKCount.Add(1)
+					if sackReleased.Load() {
+						continue
+					}
+					select {
+					case heldGapSACK <- append([]byte(nil), raw...):
+					default:
+					}
+					return false
+				}
+			}
+		}
+		return true
+	})
+	write := func(payload []byte) {
+		t.Helper()
+		n, err := s0.WriteSCTP(payload, PayloadTypeWebRTCBinary)
+		require.NoError(t, err)
+		require.Equal(t, len(payload), n)
+	}
+	driveBridgeUntil := func(timeout time.Duration, condition func() bool) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			br.Tick()
+			if condition() {
+				return true
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return condition()
+	}
+
+	// Warm SRTT and ACK state before installing any impairment. This leaves the
+	// default timers intact while making the later RACK/PTO distinction observable.
+	for i := 0; i < 3; i++ {
+		warmup := []byte(fmt.Sprintf("warmup-%d", i))
+		write(warmup)
+		flushBuffers(br, a0, a1)
+		buf := make([]byte, 64)
+		_ = s1.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, readErr := s1.ReadSCTP(buf)
+		require.NoError(t, readErr)
+		require.Equal(t, warmup, buf[:n])
+	}
+	started := time.Now()
+	t3TimeoutsBeforeTarget := a0.stats.getNumT3Timeouts()
+	write(target)
+	require.True(t, driveBridgeUntil(2*time.Second, func() bool { return targetAttempts.Load() >= 1 }), "target original was not observed")
+	require.True(t, driveBridgeUntil(3*time.Second, func() bool { return targetAttempts.Load() >= 2 }), "target first retransmission was not observed")
+
+	a0.lock.Lock()
+	reoWnd := a0.rackReoWnd
+	inflight, ok := a0.inflightQueue.get(targetTSN.Load())
+	var sentCount uint32
+	if ok {
+		sentCount = inflight.nSent
+	}
+	a0.lock.Unlock()
+	require.True(t, reoWnd > 0, "RACK reordering window was not established")
+	require.True(t, ok, "target was not retained in the inflight queue")
+	require.Equal(t, uint32(2), sentCount, "target should have original plus one retransmission before later evidence")
+
+	// The old target's first retry is lost. Wait past its RACK window, then send
+	// a witness original and a newer sentinel whose DATA is dropped. Hold the
+	// witness's gap SACK until the sentinel is outstanding: PTO then selects the
+	// sentinel, while only RACK has newer-delivery evidence for the old retry.
+	a0.lock.Lock()
+	lastTargetSend := inflight.since
+	a0.lock.Unlock()
+	if remaining := time.Until(lastTargetSend.Add(reoWnd + time.Millisecond)); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	witnessSentAt := time.Now()
+	write(witness)
+	if !driveBridgeUntil(time.Second, func() bool { return len(heldGapSACK) > 0 }) {
+		t.Fatalf("receiver did not produce a gap SACK for the witness: witness_sends=%d target_sends=%d sacks=%d gap_sacks=%d", witnessAttempts.Load(), targetAttempts.Load(), sackCount.Load(), gapSACKCount.Load())
+	}
+	rawGapSACK := <-heldGapSACK
+	write(sentinel)
+	require.True(t, driveBridgeUntil(time.Second, func() bool { return sentinelAttempts.Load() >= 1 }), "sentinel DATA was not held")
+	a0.lock.Lock()
+	pending := a0.pendingQueue.size()
+	a0.lock.Unlock()
+	require.Zero(t, pending, "sentinel must be sent before releasing witness feedback")
+	parsed := &packet{}
+	require.NoError(t, parsed.unmarshal(true, rawGapSACK))
+	var gapSeen bool
+	for _, c := range parsed.chunks {
+		if sack, ok := c.(*chunkSelectiveAck); ok && len(sack.gapAckBlocks) > 0 {
+			gapSeen = true
+		}
+	}
+	require.True(t, gapSeen, "held feedback must contain a gap acknowledgment")
+	require.Equal(t, uint32(2), targetAttempts.Load(), "target must still have exactly its original plus first retry before ACK release")
+	require.Equal(t, t3TimeoutsBeforeTarget, a0.stats.getNumT3Timeouts(), "T3 must not fire before witness ACK release")
+	sackReleased.Store(true)
+	require.True(t, br.Push(rawGapSACK, 1), "could not release held witness SACK")
+	allowTarget.Store(true)
+	// Require the RACK retransmission before the next T3 interval. With the
+	// regression present, PTO retransmits only the newer sentinel and this
+	// target remains at its original plus first retry.
+	rtoDeadline := time.Duration(a0.rtoMgr.getRTO()/2) * time.Millisecond
+	deadline := min(rtoDeadline, 500*time.Millisecond)
+	recovered := driveBridgeUntil(deadline, func() bool { return targetAttempts.Load() >= 3 })
+	if !recovered {
+		t.Fatalf("retransmitted target was not marked lost from later witness ACK: attempts=%d sentinel_attempts=%d witness_age=%s reoWnd=%s elapsed=%s rto=%s",
+			targetAttempts.Load(), sentinelAttempts.Load(), time.Since(witnessSentAt), reoWnd, time.Since(started), time.Duration(a0.rtoMgr.getRTO())*time.Millisecond)
+	}
+	require.Equal(t, t3TimeoutsBeforeTarget, a0.stats.getNumT3Timeouts(), "target recovery must precede any T3 timeout")
+	recoveryElapsed := time.Since(witnessSentAt)
+	allowSentinel.Store(true)
+	require.True(t, driveBridgeUntil(time.Second, func() bool { return a0.BufferedAmount() == 0 }), "sender did not settle after RACK recovery")
+
+	want := [][]byte{target, witness, sentinel}
+	buf := make([]byte, 1024)
+	for i, expected := range want {
+		_ = s1.SetReadDeadline(time.Now().Add(time.Second))
+		n, ppi, err := s1.ReadSCTP(buf)
+		require.NoError(t, err)
+		require.Equal(t, PayloadTypeWebRTCBinary, ppi)
+		require.Equal(t, expected, buf[:n], "delivery %d changed or reordered", i)
+	}
+	_ = s1.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	_, _, err = s1.ReadSCTP(buf)
+	require.ErrorIs(t, err, ErrReadDeadlineExceeded, "unexpected duplicate payload")
+	t.Logf("RACK bridge loss: target_sends=%d sentinel_sends=%d gap_sack=true nSent_before_recovery=%d reoWnd=%s recovery_after_witness=%s total=%s; delivered=3 exact messages, no duplicate",
+		targetAttempts.Load(), sentinelAttempts.Load(), sentCount, reoWnd, recoveryElapsed, time.Since(started))
 }
 
 func TestRACK_DSACKInflatesAndDecays(t *testing.T) {
